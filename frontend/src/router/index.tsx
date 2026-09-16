@@ -5,6 +5,7 @@ import Cases from '@/pages/Cases'
 import CaseDetail from '@/pages/CaseDetail'
 import Clients from '@/pages/Clients'
 import Billing from '@/pages/Billing'
+import FundLedger from '@/pages/FundLedger'
 import Documents from '@/pages/Documents'
 import Profile from '@/pages/Profile'
 import AuditLogs from '@/pages/AuditLogs'
@@ -25,6 +26,7 @@ const router = createBrowserRouter([
       { path: 'cases/:id', element: <CaseDetail /> },
       { path: 'clients', element: <Clients /> },
       { path: 'billing', element: <Billing /> },
+      { path: 'fund-ledger', element: <FundLedger /> },
       { path: 'documents', element: <Documents /> },
       { path: 'profile', element: <Profile /> },
       {

@@ -64,6 +64,50 @@ CREATE TABLE IF NOT EXISTS billings (
 );
 ALTER TABLE billings ADD CONSTRAINT uni_billings_bill_no UNIQUE (bill_no);
 
+-- 案件资金往来台账：专案账户（一个案件+客户唯一），余额单位为「分」，CHECK 保证余额绝不为负。
+CREATE TABLE IF NOT EXISTS fund_accounts (
+  id BIGSERIAL PRIMARY KEY,
+  case_id BIGINT NOT NULL,
+  client_id BIGINT NOT NULL,
+  balance_cents BIGINT NOT NULL DEFAULT 0 CHECK (balance_cents >= 0),
+  version BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE fund_accounts ADD CONSTRAINT uni_fund_account_case_client UNIQUE (case_id, client_id);
+
+-- 资金往来明细：只追加（append-only）。原明细永不改、永不删；录错只能新增一笔 reversal 反向冲销。
+-- delta_cents 带符号：预收为正、支出为负、冲销与被冲销明细相反。
+CREATE TABLE IF NOT EXISTS fund_entries (
+  id BIGSERIAL PRIMARY KEY,
+  entry_no VARCHAR(40) NOT NULL DEFAULT '',
+  account_id BIGINT NOT NULL,
+  case_id BIGINT NOT NULL,
+  client_id BIGINT NOT NULL,
+  entry_type VARCHAR(20) NOT NULL,
+  delta_cents BIGINT NOT NULL,
+  balance_cents BIGINT NOT NULL,
+  idempotency_key VARCHAR(64) NOT NULL,
+  reversal_of_id BIGINT NOT NULL DEFAULT 0,
+  reversed_by_id BIGINT NOT NULL DEFAULT 0,
+  subject VARCHAR(200) NOT NULL DEFAULT '',
+  remark VARCHAR(500) NOT NULL DEFAULT '',
+  operator_id BIGINT NOT NULL DEFAULT 0,
+  operator_name VARCHAR(50) NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+ALTER TABLE fund_entries ADD CONSTRAINT uni_fund_entries_entry_no UNIQUE (entry_no);
+-- 同一幂等键只能入账一次：重复提交/并发重试在此被数据库拒绝。
+ALTER TABLE fund_entries ADD CONSTRAINT uni_fund_entry_idem UNIQUE (idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_fund_entries_account ON fund_entries (account_id);
+CREATE INDEX IF NOT EXISTS idx_fund_entries_case ON fund_entries (case_id);
+CREATE INDEX IF NOT EXISTS idx_fund_entries_client ON fund_entries (client_id);
+CREATE INDEX IF NOT EXISTS idx_fund_entries_type ON fund_entries (entry_type);
+CREATE INDEX IF NOT EXISTS idx_fund_entries_created ON fund_entries (created_at);
+-- 部分唯一索引：每条已入账明细最多被冲销一次（默认 0 不参与），杜绝重复冲销污染余额。
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_fund_entry_reversal
+  ON fund_entries (reversal_of_id) WHERE reversal_of_id <> 0;
+
 CREATE TABLE IF NOT EXISTS audit_logs (
   id BIGSERIAL PRIMARY KEY,
   operator_id BIGINT NOT NULL DEFAULT 0,
@@ -101,6 +145,16 @@ INSERT INTO billings (id, bill_no, billing_type, amount, status, case_id, client
 (2, 'BILL2026080002', 'court_fee', 5000.00, 'pending', 1, 1, '', NOW()),
 (3, 'BILL2026080003', 'attorney_fee', 15000.00, 'invoiced', 2, 2, '已开票 15000 元', NOW());
 
+-- 资金往来台账种子：案件1（客户1）预收 50000.00 元，办案支出 8000.00 元，专案余额 42000.00 元。
+INSERT INTO fund_accounts (id, case_id, client_id, balance_cents, version, created_at, updated_at) VALUES
+(1, 1, 1, 4200000, 2, NOW(), NOW());
+
+INSERT INTO fund_entries
+  (id, entry_no, account_id, case_id, client_id, entry_type, delta_cents, balance_cents, idempotency_key, reversal_of_id, reversed_by_id, subject, remark, operator_id, operator_name, created_at)
+VALUES
+  (1, 'PRE-SEED-0001', 1, 1, 1, 'prepayment', 5000000, 5000000, 'seed-pre-0001', 0, 0, '首期律师代理费预收', '客户华信科技银行转账', 2, 'lawyer', NOW()),
+  (2, 'EXP-SEED-0001', 1, 1, 1, 'expense',   -800000, 4200000, 'seed-exp-0001', 0, 0, '财产保全申请费', '法院出具缴费凭证', 2, 'lawyer', NOW());
+
 INSERT INTO audit_logs (id, operator_id, operator_name, action, entity_type, entity_id, detail, ip, created_at) VALUES
 (1, 1, 'admin', 'seed', 'system', '', 'init', '127.0.0.1', NOW());
 
@@ -110,4 +164,6 @@ SELECT setval(pg_get_serial_sequence('clients', 'id'), (SELECT COALESCE(MAX(id),
 SELECT setval(pg_get_serial_sequence('cases', 'id'), (SELECT COALESCE(MAX(id), 1) FROM cases));
 SELECT setval(pg_get_serial_sequence('documents', 'id'), (SELECT COALESCE(MAX(id), 1) FROM documents));
 SELECT setval(pg_get_serial_sequence('billings', 'id'), (SELECT COALESCE(MAX(id), 1) FROM billings));
+SELECT setval(pg_get_serial_sequence('fund_accounts', 'id'), (SELECT COALESCE(MAX(id), 1) FROM fund_accounts));
+SELECT setval(pg_get_serial_sequence('fund_entries', 'id'), (SELECT COALESCE(MAX(id), 1) FROM fund_entries));
 SELECT setval(pg_get_serial_sequence('audit_logs', 'id'), (SELECT COALESCE(MAX(id), 1) FROM audit_logs));

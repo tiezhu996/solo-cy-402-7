@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"cylawcase/internal/config"
+	"cylawcase/internal/database"
 	"cylawcase/internal/handler"
 	"cylawcase/internal/model"
 	"cylawcase/internal/repository"
@@ -33,8 +34,13 @@ func main() {
 	}
 	if err := db.AutoMigrate(
 		&model.User{}, &model.Client{}, &model.Case{}, &model.Document{}, &model.Billing{}, &model.AuditLog{},
+		&model.FundAccount{}, &model.FundEntry{},
 	); err != nil {
 		logger.Error("auto migrate failed", "error", err.Error())
+		os.Exit(1)
+	}
+	if err := database.EnsureFundIndexes(db); err != nil {
+		logger.Error("ensure fund indexes failed", "error", err.Error())
 		os.Exit(1)
 	}
 	if err := service.NewSeedService(db, logger).Seed(); err != nil {
@@ -47,23 +53,26 @@ func main() {
 	caseRepo := repository.NewCaseRepository(db)
 	documentRepo := repository.NewDocumentRepository(db)
 	billingRepo := repository.NewBillingRepository(db)
+	fundRepo := repository.NewFundRepository(db)
 
 	userSvc := service.NewUserService(userRepo, logger)
 	clientSvc := service.NewClientService(clientRepo, caseRepo, logger)
 	caseSvc := service.NewCaseService(caseRepo, clientRepo, userRepo, logger)
 	documentSvc := service.NewDocumentService(documentRepo, caseRepo, logger)
 	billingSvc := service.NewBillingService(billingRepo, caseRepo, clientRepo, logger)
+	fundSvc := service.NewFundService(fundRepo, caseRepo, clientRepo, logger)
 
 	userHandler := handler.NewUserHandler(userSvc, logger)
 	clientHandler := handler.NewClientHandler(clientSvc, logger)
 	caseHandler := handler.NewCaseHandler(caseSvc, logger)
 	documentHandler := handler.NewDocumentHandler(documentSvc, logger)
 	billingHandler := handler.NewBillingHandler(billingSvc, logger)
+	fundHandler := handler.NewFundHandler(fundSvc, logger)
 	uploadHandler := handler.NewUploadHandler(cfg, logger)
 	auditLogHandler := handler.NewAuditLogHandler(db, logger)
 
 	r := router.New(cfg, db, logger, userHandler, clientHandler, caseHandler,
-		documentHandler, billingHandler, uploadHandler, auditLogHandler)
+		documentHandler, billingHandler, fundHandler, uploadHandler, auditLogHandler)
 
 	srv := &http.Server{
 		Addr:    ":" + cfg.ServerPort,

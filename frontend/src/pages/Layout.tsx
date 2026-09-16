@@ -7,6 +7,7 @@ const items = [
   { key: '/cases', label: '案件列表' },
   { key: '/clients', label: '客户管理' },
   { key: '/billing', label: '费用中心' },
+  { key: '/fund-ledger', label: '资金台账' },
   { key: '/documents', label: '文档中心' },
   { key: '/audit-logs', label: '审计日志' },
   { key: '/profile', label: '个人中心' },

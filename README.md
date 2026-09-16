@@ -159,6 +159,13 @@ cy-402/
 | POST | /api/v1/billings/:id/paid | 标记支付 |
 | POST | /api/v1/billings/:id/invoiced | 标记开票 |
 | POST | /api/v1/billings/:id/void | 作废账单 |
+| GET | /api/v1/fund/entries | 资金往来明细分页（可按案件/客户/类型过滤） |
+| GET | /api/v1/fund/entries/by-case/:id | 按案件查询全部资金明细（时间正序） |
+| GET | /api/v1/fund/accounts | 专案账户余额分页（附按明细重算余额与一致性标记） |
+| GET | /api/v1/fund/balance?case_id=&client_id= | 查询某案件+客户专案余额（物化值与重算值） |
+| POST | /api/v1/fund/prepayments | 登记客户预收款（需 idempotency_key） |
+| POST | /api/v1/fund/expenses | 登记办案支出（需 idempotency_key，余额不足整笔拒绝） |
+| POST | /api/v1/fund/reversals | 反向冲销某条已入账明细（需 entry_id/reason/idempotency_key） |
 | GET | /api/v1/audit-logs | 审计日志（仅管理员） |
 | POST | /api/v1/upload/file | 文件上传 |
 
@@ -168,8 +175,40 @@ cy-402/
 - 案件管理：创建案件、状态流转（立案→调查→庭审→结案→归档）、律师分配、筛选查询。
 - 文档归档：按案件上传/查看/删除文档（起诉状/答辩状/证据/判决书/合同等）。
 - 费用结算：创建账单、标记支付、开票、作废，本月应收/已收/待收汇总。
+- 案件资金往来台账：登记客户预收款与办案支出，专案余额管控，录错只能反向冲销。
 - 审计日志：写操作自动记录（管理员查看）。
 - 角色权限：JWT + RBAC（admin/lawyer/assistant）。
+
+## 案件资金往来台账（资金安全设计）
+
+每个「案件 + 客户」对应唯一专案资金账户，律师登记的每一笔预收、支出都必须归属同一案件及其本人客户。
+金额在后端统一以「分」(int64) 存储与计算，对外 JSON 使用两位小数字符串，杜绝浮点误差。
+
+业务不变量：
+
+- **同案同客户**：写入时校验案件存在、客户存在，且 `case.client_id` 与提交客户一致，否则拒绝（422）。
+- **专案余额、整笔拒绝**：支出只能使用该案可用余额。原子条件更新
+  `UPDATE fund_accounts SET balance_cents = balance_cents + ? WHERE id=? AND balance_cents + ? >= 0`
+  配合 `CHECK (balance_cents >= 0)`，余额不足时整笔事务回滚——**不写明细、不动余额，原明细保持不变**（409 / 40903）。
+- **只追加、不可改删**：明细为 append-only，不存在 update/delete 接口；录错只能新增一笔方向相反的冲销明细。
+- **冲销只能一次**：原明细 `reversed_by_id` 乐观抢占 + 部分唯一索引
+  `CREATE UNIQUE INDEX ... ON fund_entries(reversal_of_id) WHERE reversal_of_id <> 0` 双重保证；
+  并发重复冲销只有一笔成功，其余返回 409 / 40904，**绝不重复冲销、污染余额**。
+- **幂等只入账一次**：预收/支出/冲销都要求 `idempotency_key`，唯一索引保证重复提交、网络重试、并发同键只有一笔入账，
+  其余返回首次结果（响应 `replayed=true`）。前端使用 `crypto.randomUUID()` 生成。
+- **重启一致**：余额是明细的物化缓存，权威余额始终可由 `SUM(delta_cents)` 重算；
+  `GET /fund/balance` 与账户列表同时返回物化值、重算值与 `consistent` 标记。
+
+并发控制：写事务内对专案账户行 `SELECT ... FOR UPDATE` 串行化（SQLite 等无行锁方言由进程内写互斥补充），
+冲突后回查幂等键，跨进程仍以数据库唯一约束为准。相关表：`fund_accounts`、`fund_entries`。
+
+### FundEntryType（prepayment/expense/reversal）出现位置
+
+- 后端：`backend/internal/constants/fund.go`、`backend/internal/model/fund.go`、`backend/internal/repository/fund_repository.go`、
+  `backend/internal/service/fund_service.go`、`backend/internal/handler/fund_handler.go`、`backend/internal/dto/dto_fund.go`、
+  `backend/internal/constants/error_codes.go`、`backend/internal/constants/messages.go`、`backend/internal/constants/log_templates.go`、`database/init.sql`
+- 前端：`frontend/src/constants/fund.ts`、`frontend/src/types/index.ts`、`frontend/src/api/fund.ts`、
+  `frontend/src/stores/fundStore.ts`、`frontend/src/pages/FundLedger.tsx`
 
 ## License
 

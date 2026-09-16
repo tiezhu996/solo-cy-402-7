@@ -15,6 +15,9 @@ const (
 	CodeInvalidCredentials    = 40101
 	CodeCaseStatusConflict    = 40901
 	CodeBillingStatusConflict = 40902
+	CodeFundInsufficient      = 40903 // 专案可用余额不足，支出整笔拒绝
+	CodeFundAlreadyReversed   = 40904 // 明细已被冲销，禁止重复冲销
+	CodeFundConflict          = 40905 // 资金台账并发冲突
 	CodeUploadTooLarge        = 41300
 	CodeUnsupportedType       = 41500
 )

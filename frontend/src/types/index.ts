@@ -58,6 +58,38 @@ export interface Billing {
   created_at: string
 }
 
+// 资金往来明细：金额均为两位小数字符串（元），与后端 dto.FundEntryResponse 对齐。
+export interface FundEntry {
+  id: number
+  entry_no: string
+  account_id: number
+  case_id: number
+  client_id: number
+  entry_type: string
+  amount: string
+  delta: string
+  balance: string
+  idempotency_key: string
+  reversal_of_id: number
+  reversed_by_id: number
+  reversed: boolean
+  subject: string
+  remark: string
+  operator_id: number
+  operator_name: string
+  created_at: string
+}
+
+export interface FundAccount {
+  id: number
+  case_id: number
+  client_id: number
+  balance: string
+  reconciled_balance: string
+  consistent: boolean
+  updated_at: string
+}
+
 export interface AuditLog {
   id: number
   operator_id: number
