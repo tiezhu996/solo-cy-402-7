@@ -426,6 +426,107 @@ func TestSameKeyReplayAfterReversalShowsLink(t *testing.T) {
 	}
 }
 
+// 8c. 同一幂等键被内容不同的请求复用时必须拒绝（40906），不能回放无关明细；完全一致才回放。
+func TestIdempotencyKeyMismatchRejected(t *testing.T) {
+	db := newTestDB(t)
+	svc, caseID, clientID := newFundService(seededDB(t, db))
+
+	// 第二个客户与案件，用于校验案件/客户维度。
+	otherClient := &model.Client{Name: "其他客户"}
+	if err := db.Create(otherClient).Error; err != nil {
+		t.Fatal(err)
+	}
+	otherCase := &model.Case{CaseNo: "CASE-OTHER", Title: "其他案件", ClientID: otherClient.ID, LeadLawyerID: 1}
+	if err := db.Create(otherCase).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	first := mustPrepay(t, svc, caseID, clientID, 1000, "shared-key")
+
+	cases := []struct {
+		name     string
+		wantCode int
+		call     func() error
+	}{
+		{
+			"不同金额", constants.CodeFundIdempotencyMismatch,
+			func() error {
+				_, _, e := svc.RegisterPrepayment(caseID, clientID, 2000, "", "", "shared-key", testOp)
+				return e
+			},
+		},
+		{
+			"不同资金类型(预收键用于支出)", constants.CodeFundIdempotencyMismatch,
+			func() error {
+				_, _, e := svc.RegisterExpense(caseID, clientID, 1000, "", "", "shared-key", testOp)
+				return e
+			},
+		},
+		{
+			"同案件挂非本人客户(归属校验先拒绝)", constants.CodeValidationFailed,
+			func() error {
+				_, _, e := svc.RegisterPrepayment(caseID, otherClient.ID, 1000, "", "", "shared-key", testOp)
+				return e
+			},
+		},
+		{
+			"不同案件且内容不同", constants.CodeFundIdempotencyMismatch,
+			func() error {
+				_, _, e := svc.RegisterPrepayment(otherCase.ID, otherClient.ID, 1000, "", "", "shared-key", testOp)
+				return e
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+			if code := appErrorCode(t, err); code != tc.wantCode {
+				t.Fatalf("code=%d, want %d (%v)", code, tc.wantCode, err)
+			}
+		})
+	}
+
+	// 内容完全一致的重试仍正常回放同一笔。
+	replay, replayed, err := svc.RegisterPrepayment(caseID, clientID, 1000, "别的备注", "", "shared-key", testOp)
+	if err != nil || !replayed || replay.ID != first.ID {
+		t.Fatalf("identical retry must replay: err=%v replayed=%v", err, replayed)
+	}
+	// 没有任何新记录、余额不变（仅 1000）。
+	if n := countEntries(t, db); n != 1 {
+		t.Fatalf("entries=%d, want 1 (no unrelated records inserted)", n)
+	}
+	if got := mustBalance(t, svc, caseID, clientID); got != 1000 {
+		t.Fatalf("balance=%d, want 1000", got)
+	}
+}
+
+// 8d. 同一冲销幂等键被用于冲销不同原明细时必须拒绝。
+func TestIdempotencyReversalTargetMismatch(t *testing.T) {
+	db := newTestDB(t)
+	svc, caseID, clientID := newFundService(seededDB(t, db))
+	pre := mustPrepay(t, svc, caseID, clientID, 1000, "k-pre")
+	exp, _, err := svc.RegisterExpense(caseID, clientID, 300, "支出", "", "k-exp", testOp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 用 rev-key 冲销支出（+300），余额回到 1000。
+	if _, _, err := svc.ReverseEntry(exp.ID, "冲销支出", "rev-key", testOp); err != nil {
+		t.Fatalf("first reverse: %v", err)
+	}
+	// 同键改冲销预收（不同冲销对象）→ 拒绝。
+	_, _, err = svc.ReverseEntry(pre.ID, "改冲预收", "rev-key", testOp)
+	if code := appErrorCode(t, err); code != constants.CodeFundIdempotencyMismatch {
+		t.Fatalf("code=%d, want %d", code, constants.CodeFundIdempotencyMismatch)
+	}
+	// 预收仍未被冲销：换一个新键冲销预收应成功（余额 1000 足够 -1000）。
+	if _, _, err := svc.ReverseEntry(pre.ID, "正常冲销预收", "rev-key-2", testOp); err != nil {
+		t.Fatalf("reverse prepay with new key: %v", err)
+	}
+	if got := mustBalance(t, svc, caseID, clientID); got != 0 {
+		t.Fatalf("balance=%d, want 0", got)
+	}
+}
+
 // 9. 冲销预收款但当前余额不足：拒绝，余额与明细不变。
 func TestReversePrepaymentInsufficientDenied(t *testing.T) {
 	db := newTestDB(t)

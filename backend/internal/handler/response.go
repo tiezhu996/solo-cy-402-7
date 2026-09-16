@@ -38,7 +38,8 @@ func appErrorStatus(code int) int {
 	case constants.CodeNotFound:
 		return http.StatusNotFound
 	case constants.CodeConflict, constants.CodeCaseStatusConflict, constants.CodeBillingStatusConflict,
-		constants.CodeFundInsufficient, constants.CodeFundAlreadyReversed, constants.CodeFundConflict:
+		constants.CodeFundInsufficient, constants.CodeFundAlreadyReversed, constants.CodeFundConflict,
+		constants.CodeFundIdempotencyMismatch:
 		return http.StatusConflict
 	case constants.CodeValidationFailed:
 		return http.StatusUnprocessableEntity

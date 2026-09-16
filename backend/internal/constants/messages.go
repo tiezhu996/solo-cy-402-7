@@ -24,10 +24,11 @@ const (
 	MsgBillingInvoiced       = "账单已开票"
 	MsgBillingVoided         = "账单已作废"
 
-	MsgFundPrepaymentCreated = "预收已入账"
-	MsgFundExpenseCreated    = "支出已入账"
-	MsgFundReversed          = "已反向冲销"
-	MsgFundInsufficient      = "专案可用余额不足，支出整笔拒绝"
-	MsgFundAlreadyReversed   = "该明细已冲销，不能重复冲销"
-	MsgFundEntryNotFound     = "资金明细不存在"
+	MsgFundPrepaymentCreated   = "预收已入账"
+	MsgFundExpenseCreated      = "支出已入账"
+	MsgFundReversed            = "已反向冲销"
+	MsgFundInsufficient        = "专案可用余额不足，支出整笔拒绝"
+	MsgFundAlreadyReversed     = "该明细已冲销，不能重复冲销"
+	MsgFundEntryNotFound       = "资金明细不存在"
+	MsgFundIdempotencyMismatch = "幂等键已被内容不同的请求使用，不能回放无关明细，请使用新的幂等键"
 )

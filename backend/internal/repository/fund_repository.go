@@ -65,14 +65,82 @@ func forUpdate(tx *gorm.DB) *gorm.DB {
 	return tx.Clauses(clause.Locking{Strength: "UPDATE"})
 }
 
-// replayIfPresent 在事务失败后用全新读取按幂等键回查：
-// 若另一并发事务已用同一幂等键入账，则返回该笔作为「幂等重放」，保证重复提交/并发重试只入账一次。
-func (r *FundRepository) replayIfPresent(key string) (*PostedResult, bool) {
-	if key == "" {
+// idemFingerprint 描述一笔请求在幂等回放时必须与已入账明细逐项一致的内容。
+// 幂等键不是全局「任意请求去重符」：案件、客户、资金类型、（预收/支出的）金额以及冲销对象
+// 任一不一致，都视为幂等键被不同请求复用，拒绝并返回 ErrIdempotencyMismatch，绝不回放无关明细。
+type idemFingerprint struct {
+	Idem         string
+	CaseID       uint64
+	ClientID     uint64
+	EntryType    string
+	DeltaCents   int64
+	ReversalOfID uint64
+	checkDelta   bool
+}
+
+// entryFingerprint 预收/支出请求的内容指纹（带符号金额：预收为正、支出为负）。
+func entryFingerprint(key string, e *model.FundEntry) idemFingerprint {
+	return idemFingerprint{
+		Idem: key, CaseID: e.CaseID, ClientID: e.ClientID, EntryType: e.EntryType,
+		DeltaCents: e.DeltaCents, checkDelta: true,
+	}
+}
+
+// reversalFingerprint 冲销请求的内容指纹：只要求类型与冲销对象一致；
+// 案件、客户、金额均由被冲销原明细派生，不参与请求方比较。
+func reversalFingerprint(key string, originID uint64) idemFingerprint {
+	return idemFingerprint{Idem: key, EntryType: "reversal", ReversalOfID: originID}
+}
+
+// match 校验已入账明细与请求内容是否逐项一致。
+func (f idemFingerprint) match(stored *model.FundEntry) error {
+	if f.EntryType != "" && stored.EntryType != f.EntryType {
+		return ErrIdempotencyMismatch
+	}
+	if f.ReversalOfID != stored.ReversalOfID {
+		return ErrIdempotencyMismatch
+	}
+	if f.CaseID != 0 && stored.CaseID != f.CaseID {
+		return ErrIdempotencyMismatch
+	}
+	if f.ClientID != 0 && stored.ClientID != f.ClientID {
+		return ErrIdempotencyMismatch
+	}
+	if f.checkDelta && stored.DeltaCents != f.DeltaCents {
+		return ErrIdempotencyMismatch
+	}
+	return nil
+}
+
+// lookupIdempotent 在事务内按幂等键回查，并在返回前校验内容指纹一致。
+// 返回 (已存在明细, 是否回放, 错误)；内容不一致时返回 ErrIdempotencyMismatch。
+func (r *FundRepository) lookupIdempotent(tx *gorm.DB, key string, want idemFingerprint) (*model.FundEntry, bool, error) {
+	existing, err := r.FindEntryByIdempotencyKey(tx, key)
+	if err != nil {
+		return nil, false, err
+	}
+	if existing == nil {
+		return nil, false, nil
+	}
+	if err := want.match(existing); err != nil {
+		return nil, false, err
+	}
+	if err := r.hydrateReversed(tx, existing); err != nil {
+		return nil, false, err
+	}
+	return existing, true, nil
+}
+
+// replayIfPresent 在事务失败后用全新读取按幂等键回查，且必须与请求内容指纹一致才回放。
+func (r *FundRepository) replayIfPresent(want idemFingerprint) (*PostedResult, bool) {
+	if want.Idem == "" {
 		return nil, false
 	}
-	e, err := r.FindEntryByIdempotencyKey(r.db, key)
+	e, err := r.FindEntryByIdempotencyKey(r.db, want.Idem)
 	if err != nil || e == nil {
+		return nil, false
+	}
+	if err := want.match(e); err != nil {
 		return nil, false
 	}
 	if err := r.hydrateReversed(r.db, e); err != nil {
@@ -81,13 +149,13 @@ func (r *FundRepository) replayIfPresent(key string) (*PostedResult, bool) {
 	return &PostedResult{Entry: e, Replayed: true, AccountID: e.AccountID}, true
 }
 
-// finalize 事务提交后为返回明细补齐反向冲销关联，使新入账与同键重放的响应口径一致。
-func (r *FundRepository) finalize(result *PostedResult, err error, idem string) (*PostedResult, error) {
-	if err != nil {
-		if replay, ok := r.replayIfPresent(idem); ok {
+// finalize 事务提交后为返回明细补齐反向冲销关联；失败时按内容指纹安全回放同键首笔。
+func (r *FundRepository) finalize(result *PostedResult, txErr error, want idemFingerprint) (*PostedResult, error) {
+	if txErr != nil {
+		if replay, ok := r.replayIfPresent(want); ok {
 			return replay, nil
 		}
-		return nil, err
+		return nil, txErr
 	}
 	if result != nil && result.Entry != nil {
 		if herr := r.hydrateReversed(r.db, result.Entry); herr != nil {
@@ -283,10 +351,11 @@ func (r *FundRepository) PostPrepayment(entry *model.FundEntry) (*PostedResult, 
 	var result *PostedResult
 	release := r.beginWrite()
 	defer release()
+	want := entryFingerprint(entry.IdempotencyKey, entry)
 	err := r.db.Transaction(func(tx *gorm.DB) error {
-		if existing, err := r.FindEntryByIdempotencyKey(tx, entry.IdempotencyKey); err != nil {
+		if existing, replay, err := r.lookupIdempotent(tx, entry.IdempotencyKey, want); err != nil {
 			return err
-		} else if existing != nil {
+		} else if replay {
 			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
 			return nil
 		}
@@ -295,10 +364,10 @@ func (r *FundRepository) PostPrepayment(entry *model.FundEntry) (*PostedResult, 
 			return err
 		}
 		// 拿到账户行锁后再查一次幂等键：多实例下另一实例可能已在锁等待期间提交同键首笔，
-		// 此时必须回放该笔，绝不能再插入（否则会触发唯一冲突并污染事务）。
-		if existing, err := r.FindEntryByIdempotencyKey(tx, entry.IdempotencyKey); err != nil {
+		// 此时必须回放该笔（且内容一致），绝不能再插入。
+		if existing, replay, err := r.lookupIdempotent(tx, entry.IdempotencyKey, want); err != nil {
 			return err
-		} else if existing != nil {
+		} else if replay {
 			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
 			return nil
 		}
@@ -319,7 +388,7 @@ func (r *FundRepository) PostPrepayment(entry *model.FundEntry) (*PostedResult, 
 		result = &PostedResult{Entry: entry, AccountID: acc.ID}
 		return nil
 	})
-	return r.finalize(result, err, entry.IdempotencyKey)
+	return r.finalize(result, err, want)
 }
 
 // PostExpense 登记一笔办案支出（delta 为负）。余额不足时条件不命中 → 返回 ErrInsufficient，
@@ -331,10 +400,11 @@ func (r *FundRepository) PostExpense(entry *model.FundEntry) (*PostedResult, err
 	var result *PostedResult
 	release := r.beginWrite()
 	defer release()
+	want := entryFingerprint(entry.IdempotencyKey, entry)
 	err := r.db.Transaction(func(tx *gorm.DB) error {
-		if existing, err := r.FindEntryByIdempotencyKey(tx, entry.IdempotencyKey); err != nil {
+		if existing, replay, err := r.lookupIdempotent(tx, entry.IdempotencyKey, want); err != nil {
 			return err
-		} else if existing != nil {
+		} else if replay {
 			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
 			return nil
 		}
@@ -342,10 +412,10 @@ func (r *FundRepository) PostExpense(entry *model.FundEntry) (*PostedResult, err
 		if err != nil {
 			return err
 		}
-		// 同预收：行锁后复查幂等键，避免多实例同键并发在等待锁后重复插入。
-		if existing, err := r.FindEntryByIdempotencyKey(tx, entry.IdempotencyKey); err != nil {
+		// 同预收：行锁后复查幂等键（内容一致才回放），避免多实例同键并发在等待锁后重复插入。
+		if existing, replay, err := r.lookupIdempotent(tx, entry.IdempotencyKey, want); err != nil {
 			return err
-		} else if existing != nil {
+		} else if replay {
 			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
 			return nil
 		}
@@ -369,7 +439,7 @@ func (r *FundRepository) PostExpense(entry *model.FundEntry) (*PostedResult, err
 		result = &PostedResult{Entry: entry, AccountID: acc.ID}
 		return nil
 	})
-	return r.finalize(result, err, entry.IdempotencyKey)
+	return r.finalize(result, err, want)
 }
 
 // PostReversal 对一条已入账明细做反向冲销，整笔事务：
@@ -384,10 +454,11 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 	var result *PostedResult
 	release := r.beginWrite()
 	defer release()
+	want := reversalFingerprint(reversal.IdempotencyKey, originID)
 	err := r.db.Transaction(func(tx *gorm.DB) error {
-		if existing, err := r.FindEntryByIdempotencyKey(tx, reversal.IdempotencyKey); err != nil {
+		if existing, replay, err := r.lookupIdempotent(tx, reversal.IdempotencyKey, want); err != nil {
 			return err
-		} else if existing != nil {
+		} else if replay {
 			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
 			return nil
 		}
@@ -399,11 +470,11 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 		if origin.IsReversal() {
 			return ErrCannotReverseReversal
 		}
-		// 锁住原明细后复查幂等键：多实例下同键冲销并发，落败方在 FOR UPDATE 等待后，
-		// 胜出方已提交该冲销明细，此时应回放首笔，而不是按「已冲销」拒绝。
-		if existing, err := r.FindEntryByIdempotencyKey(tx, reversal.IdempotencyKey); err != nil {
+		// 锁住原明细后复查幂等键（内容指纹含冲销对象，必须一致才回放）：
+		// 多实例下同键冲销并发，落败方在 FOR UPDATE 等待后胜出方已提交，此时回放首笔。
+		if existing, replay, err := r.lookupIdempotent(tx, reversal.IdempotencyKey, want); err != nil {
 			return err
-		} else if existing != nil {
+		} else if replay {
 			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
 			return nil
 		}
@@ -422,9 +493,9 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 			return err
 		}
 		// 账户锁后再保险复查一次幂等键。
-		if existing, err := r.FindEntryByIdempotencyKey(tx, reversal.IdempotencyKey); err != nil {
+		if existing, replay, err := r.lookupIdempotent(tx, reversal.IdempotencyKey, want); err != nil {
 			return err
-		} else if existing != nil {
+		} else if replay {
 			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
 			return nil
 		}
@@ -470,7 +541,7 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 		result = &PostedResult{Entry: reversal, AccountID: acc.ID}
 		return nil
 	})
-	return r.finalize(result, err, reversal.IdempotencyKey)
+	return r.finalize(result, err, want)
 }
 
 // ReconcileAccount 重算指定专案账户的权威余额（对 posted 明细求带符号和），

@@ -106,6 +106,24 @@ func TestFundHTTPEndToEnd(t *testing.T) {
 		t.Fatalf("retry must replay: code=%d body=%v", code, body2)
 	}
 
+	// 同键但金额不同：拒绝为幂等冲突（40906），不得回放无关明细、不得入账。
+	code, body = doJSON(t, r, "POST", "/api/v1/fund/prepayments", map[string]any{
+		"case_id": caseID, "client_id": 1, "amount": "200.00",
+		"subject": "金额被改", "idempotency_key": idem1,
+	})
+	if code != http.StatusConflict || body["code"].(float64) != 40906 {
+		t.Fatalf("mismatched replay code=%d body=%v", code, body)
+	}
+
+	// 同键但资金类型不同（预收键用于支出）：同样拒绝为幂等冲突。
+	code, body = doJSON(t, r, "POST", "/api/v1/fund/expenses", map[string]any{
+		"case_id": caseID, "client_id": 1, "amount": "100.00",
+		"idempotency_key": idem1,
+	})
+	if code != http.StatusConflict || body["code"].(float64) != 40906 {
+		t.Fatalf("cross-type replay code=%d body=%v", code, body)
+	}
+
 	// 超额支出 150 → 409 / 40903，整笔拒绝。
 	code, body = doJSON(t, r, "POST", "/api/v1/fund/expenses", map[string]any{
 		"case_id": caseID, "client_id": 1, "amount": "150.00",

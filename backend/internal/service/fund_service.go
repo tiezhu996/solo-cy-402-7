@@ -192,6 +192,9 @@ func (s *FundService) mapReverseError(err error, originID uint64) error {
 	case errors.Is(err, repository.ErrInsufficient):
 		return util.NewAppError(constants.CodeFundInsufficient,
 			fmt.Sprintf("Fund[entry_id=%d] reverse: %s", originID, constants.MsgFundInsufficient))
+	case errors.Is(err, repository.ErrIdempotencyMismatch):
+		return util.NewAppError(constants.CodeFundIdempotencyMismatch,
+			fmt.Sprintf("Fund[entry_id=%d] reverse: %s", originID, constants.MsgFundIdempotencyMismatch))
 	default:
 		return util.Wrap(err, "Fund[entry_id=%d] reverse failed", originID)
 	}
@@ -203,6 +206,9 @@ func (s *FundService) mapRepoError(err error, action string) error {
 		return util.NewAppError(constants.CodeConflict, fmt.Sprintf("Fund %s: duplicate request", action))
 	case errors.Is(err, repository.ErrConflict):
 		return util.NewAppError(constants.CodeFundConflict, fmt.Sprintf("Fund %s: concurrent conflict, please retry", action))
+	case errors.Is(err, repository.ErrIdempotencyMismatch):
+		return util.NewAppError(constants.CodeFundIdempotencyMismatch,
+			fmt.Sprintf("Fund %s: %s", action, constants.MsgFundIdempotencyMismatch))
 	default:
 		return err
 	}

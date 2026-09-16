@@ -12,4 +12,6 @@ var (
 	ErrAlreadyReversed       = errors.New("fund entry already reversed")
 	ErrCannotReverseReversal = errors.New("cannot reverse a reversal entry")
 	ErrConflict              = errors.New("fund concurrent conflict")
+	// ErrIdempotencyMismatch 同一幂等键已被内容不同的另一请求使用，禁止回放无关明细。
+	ErrIdempotencyMismatch = errors.New("idempotency key reused with a different request")
 )
