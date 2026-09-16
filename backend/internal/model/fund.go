@@ -31,10 +31,11 @@ type FundEntry struct {
 	BalanceCents   int64  `gorm:"not null" json:"balance_cents"`
 	IdempotencyKey string `gorm:"size:64;not null;uniqueIndex:uni_fund_entry_idem,priority:1" json:"idempotency_key"`
 	// ReversalOfID 非 0 表示本明细是对某条已入账明细的反向冲销。
-	// 「只能冲销一次」由部分唯一索引（WHERE reversal_of_id <> 0）与 reversed_by_id 乐观抢占共同保证。
+	// 「每条明细最多被冲销一次」完全由部分唯一索引（WHERE reversal_of_id <> 0）在数据库层保证。
 	ReversalOfID uint64 `gorm:"not null;default:0;index" json:"reversal_of_id"`
-	// ReversedByID 非 0 表示本明细已被该冲销明细反向，原明细仍保留不改。
-	ReversedByID uint64    `gorm:"not null;default:0;index" json:"reversed_by_id"`
+	// ReversedByID 不入库：原明细在冲销时绝不被写回。是否已冲销/由哪笔冲销，
+	// 在读取时按 reversal_of_id 反向关联临时填充（见 repository.AttachReversedByID）。
+	ReversedByID uint64    `gorm:"-" json:"reversed_by_id"`
 	Subject      string    `gorm:"size:200;not null;default:''" json:"subject"`
 	Remark       string    `gorm:"size:500;not null;default:''" json:"remark"`
 	OperatorID   uint64    `gorm:"not null;default:0" json:"operator_id"`

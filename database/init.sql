@@ -89,7 +89,6 @@ CREATE TABLE IF NOT EXISTS fund_entries (
   balance_cents BIGINT NOT NULL,
   idempotency_key VARCHAR(64) NOT NULL,
   reversal_of_id BIGINT NOT NULL DEFAULT 0,
-  reversed_by_id BIGINT NOT NULL DEFAULT 0,
   subject VARCHAR(200) NOT NULL DEFAULT '',
   remark VARCHAR(500) NOT NULL DEFAULT '',
   operator_id BIGINT NOT NULL DEFAULT 0,
@@ -150,10 +149,10 @@ INSERT INTO fund_accounts (id, case_id, client_id, balance_cents, version, creat
 (1, 1, 1, 4200000, 2, NOW(), NOW());
 
 INSERT INTO fund_entries
-  (id, entry_no, account_id, case_id, client_id, entry_type, delta_cents, balance_cents, idempotency_key, reversal_of_id, reversed_by_id, subject, remark, operator_id, operator_name, created_at)
+  (id, entry_no, account_id, case_id, client_id, entry_type, delta_cents, balance_cents, idempotency_key, reversal_of_id, subject, remark, operator_id, operator_name, created_at)
 VALUES
-  (1, 'PRE-SEED-0001', 1, 1, 1, 'prepayment', 5000000, 5000000, 'seed-pre-0001', 0, 0, '首期律师代理费预收', '客户华信科技银行转账', 2, 'lawyer', NOW()),
-  (2, 'EXP-SEED-0001', 1, 1, 1, 'expense',   -800000, 4200000, 'seed-exp-0001', 0, 0, '财产保全申请费', '法院出具缴费凭证', 2, 'lawyer', NOW());
+  (1, 'PRE-SEED-0001', 1, 1, 1, 'prepayment', 5000000, 5000000, 'seed-pre-0001', 0, '首期律师代理费预收', '客户华信科技银行转账', 2, 'lawyer', NOW()),
+  (2, 'EXP-SEED-0001', 1, 1, 1, 'expense',   -800000, 4200000, 'seed-exp-0001', 0, '财产保全申请费', '法院出具缴费凭证', 2, 'lawyer', NOW());
 
 INSERT INTO audit_logs (id, operator_id, operator_name, action, entity_type, entity_id, detail, ip, created_at) VALUES
 (1, 1, 'admin', 'seed', 'system', '', 'init', '127.0.0.1', NOW());

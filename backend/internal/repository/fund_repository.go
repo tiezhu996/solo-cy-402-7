@@ -18,9 +18,9 @@ import (
 // 正确性由两层保证：
 //  1. 数据库层（权威、跨进程）：写事务内对专案账户行 SELECT ... FOR UPDATE 串行化；
 //     余额非负由「条件 UPDATE ... WHERE balance_cents + ? >= 0」与 CHECK 约束双重兜底；
-//     幂等键唯一索引保证重复提交/并发重试只入账一次；部分唯一索引 + reversed_by_id 抢占
-//     保证同一明细最多被冲销一次。账户创建用 INSERT ... ON CONFLICT DO NOTHING，多实例并发
-//     首笔也不会因唯一冲突导致事务 abort 而返回内部错误。
+//     幂等键唯一索引保证重复提交/并发重试只入账一次；reversal_of_id 上的部分唯一索引
+//     保证同一明细最多被冲销一次（冲销只追加新行，原明细绝不被 UPDATE）。账户创建用
+//     INSERT ... ON CONFLICT DO NOTHING，多实例并发首笔也不会因唯一冲突导致事务 abort。
 //  2. 进程层（补充、确定性）：Postgres 由行锁保证跨实例正确，仅用本仓储互斥减少无谓回滚；
 //     SQLite 没有行锁，用包级全局互斥把所有资金写事务串行化（含不同仓储/服务实例），
 //     避免其 deferred 事务的 SQLITE_BUSY_SNAPSHOT 写冲突。
@@ -181,17 +181,55 @@ func (r *FundRepository) insertEntry(tx *gorm.DB, e *model.FundEntry) error {
 	return nil
 }
 
-// markReversalLink 记录「原明细 -> 冲销明细」的关联。
-// 通过在原明细行写入 reversed_by_id（仅当其仍为 0）实现乐观抢占：
-// 并发重复冲销时只有一笔 RowsAffected=1，另一笔为 0，从而被拒绝，绝不重复冲销、污染余额。
-func (r *FundRepository) markReversalLink(tx *gorm.DB, originID, reversalID uint64) (bool, error) {
-	res := tx.Model(&model.FundEntry{}).
-		Where("id = ? AND reversal_of_id = 0 AND reversed_by_id = 0", originID).
-		Update("reversed_by_id", reversalID)
-	if res.Error != nil {
-		return false, fmt.Errorf("mark reversal link: %w", res.Error)
+// findExistingReversalID 返回某条原明细是否已被冲销（查询冲销明细的 reversal_of_id，只读、不改原行）。
+func (r *FundRepository) findExistingReversalID(tx *gorm.DB, originID uint64) (uint64, error) {
+	var rev model.FundEntry
+	err := tx.Where("reversal_of_id = ?", originID).First(&rev).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return 0, nil
 	}
-	return res.RowsAffected == 1, nil
+	if err != nil {
+		return 0, fmt.Errorf("find existing reversal: %w", err)
+	}
+	return rev.ID, nil
+}
+
+// AttachReversedByID 为一批明细按 reversal_of_id 反向填充「已被哪笔冲销」。
+// 这是只读派生：原明细本身从不被写回，金额、余额快照、幂等键等保持入账时原样。
+func (r *FundRepository) AttachReversedByID(entries []model.FundEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	originIDs := make([]uint64, 0, len(entries))
+	for i := range entries {
+		if entries[i].EntryType != "reversal" {
+			originIDs = append(originIDs, entries[i].ID)
+		}
+	}
+	if len(originIDs) == 0 {
+		return nil
+	}
+	type link struct {
+		ReversalOfID uint64
+		ID           uint64
+	}
+	var links []link
+	if err := r.db.Model(&model.FundEntry{}).
+		Select("id, reversal_of_id").
+		Where("reversal_of_id IN ?", originIDs).
+		Scan(&links).Error; err != nil {
+		return fmt.Errorf("attach reversed_by_id: %w", err)
+	}
+	byOrigin := make(map[uint64]uint64, len(links))
+	for _, l := range links {
+		byOrigin[l.ReversalOfID] = l.ID
+	}
+	for i := range entries {
+		if rid, ok := byOrigin[entries[i].ID]; ok {
+			entries[i].ReversedByID = rid
+		}
+	}
+	return nil
 }
 
 // PostPrepayment 登记一笔客户预收款（delta 为正），整笔事务。
@@ -306,10 +344,12 @@ func (r *FundRepository) PostExpense(entry *model.FundEntry) (*PostedResult, err
 
 // PostReversal 对一条已入账明细做反向冲销，整笔事务：
 //  1. 命中幂等键则直接返回原冲销明细；
-//  2. 锁定并校验原明细（存在、未被冲销、且自身不是冲销明细）；
+//  2. 锁定并校验原明细（存在、未被冲销、且自身不是冲销明细）；是否已冲销只读查询 reversal_of_id；
 //  3. 锁定同一专案账户，反向 delta 条件扣减（冲销预收款会占用余额，余额不足则拒绝）；
-//  4. 乐观抢占 reversed_by_id，并发重复冲销只有一笔成功；
-//  5. 追加冲销明细。原明细永不修改、永不删除。
+//  4. 追加冲销明细（其 reversal_of_id 指向原明细）。
+//
+// 原明细全程不被 UPDATE：金额、余额快照、幂等键、关联字段保持入账时原样；
+// 「最多冲销一次」由部分唯一索引在插入层保证，并发重复冲销只有一笔插入成功，其余回滚。
 func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64) (*PostedResult, error) {
 	var result *PostedResult
 	release := r.beginWrite()
@@ -337,8 +377,13 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
 			return nil
 		}
-		// 行锁内若已被其他事务（用不同幂等键）冲销，立即拒绝（并发重复冲销的主路径），避免误判为余额不足。
-		if origin.ReversedByID != 0 {
+		// 行锁后只读查询该原明细是否已被冲销（不改动原行）；
+		// 多实例下用不同幂等键并发冲销时，落败方在此看到胜出方已提交的冲销并拒绝，避免误判为余额不足。
+		existingRevID, err := r.findExistingReversalID(tx, originID)
+		if err != nil {
+			return err
+		}
+		if existingRevID != 0 {
 			return ErrAlreadyReversed
 		}
 
@@ -377,21 +422,20 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 		reversal.DeltaCents = delta
 		reversal.ReversalOfID = origin.ID
 		reversal.BalanceCents = newBalance
+		// 插入前最终复查一次：并发下另一实例可能在本行锁等待期间已冲销。
+		if rid, err := r.findExistingReversalID(tx, originID); err != nil {
+			return err
+		} else if rid != 0 {
+			return ErrAlreadyReversed
+		}
 		if err := r.insertEntry(tx, reversal); err != nil {
+			// 部分唯一索引兜底：同原明细的第二笔冲销在此唯一冲突，回滚余额变动。
 			if errors.Is(err, ErrDuplicate) {
 				return ErrAlreadyReversed
 			}
 			return err
 		}
-
-		linked, err := r.markReversalLink(tx, origin.ID, reversal.ID)
-		if err != nil {
-			return err
-		}
-		if !linked {
-			// 已被其他事务冲销：回滚本次冲销与余额变动，避免重复冲销污染余额。
-			return ErrAlreadyReversed
-		}
+		// 不回写原明细：冲销关联只存在于本笔 reversal 的 reversal_of_id 上。
 
 		result = &PostedResult{Entry: reversal, AccountID: acc.ID}
 		return nil
@@ -471,6 +515,9 @@ func (r *FundRepository) ListEntries(page, pageSize int, caseID, clientID uint64
 	if err := q.Order("id DESC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&list).Error; err != nil {
 		return nil, 0, fmt.Errorf("list fund entries: %w", err)
 	}
+	if err := r.AttachReversedByID(list); err != nil {
+		return nil, 0, err
+	}
 	return list, total, nil
 }
 
@@ -479,6 +526,9 @@ func (r *FundRepository) ListEntriesByCase(caseID uint64) ([]model.FundEntry, er
 	var list []model.FundEntry
 	if err := r.db.Where("case_id = ?", caseID).Order("id ASC").Find(&list).Error; err != nil {
 		return nil, fmt.Errorf("list fund entries by case: %w", err)
+	}
+	if err := r.AttachReversedByID(list); err != nil {
+		return nil, err
 	}
 	return list, nil
 }

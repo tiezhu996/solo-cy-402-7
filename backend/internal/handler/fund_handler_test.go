@@ -148,6 +148,36 @@ func TestFundHTTPEndToEnd(t *testing.T) {
 		t.Fatalf("double reverse code=%d body=%v", code, body)
 	}
 
+	// 列表读回：原支出明细仍显示已冲销（reversed=true、reversed_by_id 指向冲销明细），
+	// 且包含那条只追加的冲销明细；原明细金额等字段不变。
+	code, body = doJSON(t, r, "GET", "/api/v1/fund/entries?case_id="+itoaH(int(caseID))+"&page_size=50", nil)
+	if code != 200 {
+		t.Fatalf("list entries: %v", body)
+	}
+	list := body["data"].(map[string]any)["list"].([]any)
+	var originOut, reversalOut map[string]any
+	for _, it := range list {
+		row := it.(map[string]any)
+		if uint64(row["id"].(float64)) == expenseID {
+			originOut = row
+		}
+		if row["entry_type"] == "reversal" {
+			reversalOut = row
+		}
+	}
+	if originOut == nil || reversalOut == nil {
+		t.Fatalf("expected origin expense and reversal in list, got %v", list)
+	}
+	if originOut["reversed"] != true {
+		t.Fatalf("origin expense must read as reversed: %v", originOut)
+	}
+	if uint64(originOut["reversed_by_id"].(float64)) != uint64(reversalOut["id"].(float64)) {
+		t.Fatalf("reversed_by_id=%v must point to reversal id=%v", originOut["reversed_by_id"], reversalOut["id"])
+	}
+	if originOut["delta"] != "-60.00" || originOut["balance"] != "40.00" {
+		t.Fatalf("origin expense fields changed after reversal: %v", originOut)
+	}
+
 	// 归属不一致（案件属于客户1，却挂客户乙）→ 422 / 42200。
 	code, body = doJSON(t, r, "POST", "/api/v1/fund/prepayments", map[string]any{
 		"case_id": caseID, "client_id": otherClient, "amount": "10.00",

@@ -191,9 +191,11 @@ cy-402/
   `UPDATE fund_accounts SET balance_cents = balance_cents + ? WHERE id=? AND balance_cents + ? >= 0`
   配合 `CHECK (balance_cents >= 0)`，余额不足时整笔事务回滚——**不写明细、不动余额，原明细保持不变**（409 / 40903）。
 - **只追加、不可改删**：明细为 append-only，不存在 update/delete 接口；录错只能新增一笔方向相反的冲销明细。
-- **冲销只能一次**：原明细 `reversed_by_id` 乐观抢占 + 部分唯一索引
-  `CREATE UNIQUE INDEX ... ON fund_entries(reversal_of_id) WHERE reversal_of_id <> 0` 双重保证；
-  并发重复冲销只有一笔成功，其余返回 409 / 40904，**绝不重复冲销、污染余额**。
+  冲销**绝不回写原行**——原明细的金额、入账后余额快照、幂等键及所有列保持入账时原样；
+  冲销关联只存在于新行的 `reversal_of_id` 上，「已冲销 / 被哪笔冲销」在读取时按该列反向关联临时派生。
+- **冲销只能一次**：完全由部分唯一索引
+  `CREATE UNIQUE INDEX ... ON fund_entries(reversal_of_id) WHERE reversal_of_id <> 0` 在插入层保证；
+  插入前再只读复查一次是否已有冲销。并发重复冲销只有一笔插入成功，其余回滚并返回 409 / 40904，**绝不重复冲销、污染余额**。
 - **幂等只入账一次**：预收/支出/冲销都要求 `idempotency_key`，唯一索引保证重复提交、网络重试、并发同键只有一笔入账，
   其余返回首次结果（响应 `replayed=true`）。前端使用 `crypto.randomUUID()` 生成。
 - **重启一致**：余额是明细的物化缓存，权威余额始终可由 `SUM(delta_cents)` 重算；

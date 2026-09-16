@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"strconv"
 	"sync"
 	"testing"
@@ -286,7 +287,9 @@ func TestConcurrentReversalOnlyOnce(t *testing.T) {
 	}
 }
 
-// 8. 原记录不可改删：冲销后原明细 delta/余额快照保持不变，仅追加反向明细。
+// 8. 原记录不可改删：冲销后原明细整行（金额、余额快照、幂等键、关联列等）保持不变，仅追加反向明细；
+//
+//	读回时仍显示已冲销（reversed_by_id 由读取派生），并拒绝再次冲销。
 func TestReversalKeepsOriginImmutable(t *testing.T) {
 	db := newTestDB(t)
 	svc, caseID, clientID := newFundService(seededDB(t, db))
@@ -296,18 +299,20 @@ func TestReversalKeepsOriginImmutable(t *testing.T) {
 	if _, _, err := svc.RegisterExpense(caseID, clientID, 300, "支出", "", "exp", testOp); err != nil {
 		t.Fatalf("expense: %v", err)
 	}
-	if _, _, err := svc.ReverseEntry(origin.ID, "冲销预收", "rev", testOp); err != nil {
-		// 余额不足时会拒绝；本案余额 700，冲销预收需 -1000，应被拒。改测冲销支出。
-		if appErrorCodeErr(err) != constants.CodeFundInsufficient {
-			t.Fatalf("unexpected: %v", err)
-		}
-	}
 
-	// 改为冲销支出（+300），原支出明细必须保持不变。
+	// 找到支出明细，并对其原始数据库行做快照（map 仅包含真实列，不含 gorm:"-" 派生字段）。
 	var expEntry model.FundEntry
 	if err := db.Where("entry_type = ?", constants.FundEntryExpense).First(&expEntry).Error; err != nil {
 		t.Fatalf("find expense: %v", err)
 	}
+	rowBefore := map[string]any{}
+	if err := db.Table("fund_entries").Where("id = ?", expEntry.ID).Take(&rowBefore).Error; err != nil {
+		t.Fatalf("snapshot row: %v", err)
+	}
+	if _, ok := rowBefore["reversed_by_id"]; ok {
+		t.Fatalf("fund_entries must not persist a reversed_by_id column")
+	}
+
 	rev, _, err := svc.ReverseEntry(expEntry.ID, "冲销支出", "rev-exp", testOp)
 	if err != nil {
 		t.Fatalf("reverse expense: %v", err)
@@ -315,17 +320,51 @@ func TestReversalKeepsOriginImmutable(t *testing.T) {
 	if rev.DeltaCents != -expEntry.DeltaCents {
 		t.Fatalf("reversal delta=%d, want %d", rev.DeltaCents, -expEntry.DeltaCents)
 	}
+
+	// 冲销后原始行必须逐列不变。
+	rowAfter := map[string]any{}
+	if err := db.Table("fund_entries").Where("id = ?", expEntry.ID).Take(&rowAfter).Error; err != nil {
+		t.Fatalf("reload row: %v", err)
+	}
+	if !reflect.DeepEqual(rowBefore, rowAfter) {
+		t.Fatalf("origin row mutated by reversal:\nbefore=%v\nafter =%v", rowBefore, rowAfter)
+	}
+
+	// 直接 ORM 读取时，gorm:"-" 派生字段为零，证明没有任何回写。
 	var reloaded model.FundEntry
 	if err := db.First(&reloaded, expEntry.ID).Error; err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if reloaded.DeltaCents != expEntry.DeltaCents || reloaded.BalanceCents != expEntry.BalanceCents {
-		t.Fatalf("origin expense mutated: delta %d->%d snap %d->%d",
-			expEntry.DeltaCents, reloaded.DeltaCents, expEntry.BalanceCents, reloaded.BalanceCents)
+	if reloaded.DeltaCents != expEntry.DeltaCents || reloaded.BalanceCents != expEntry.BalanceCents ||
+		reloaded.IdempotencyKey != expEntry.IdempotencyKey || reloaded.ReversalOfID != 0 || reloaded.ReversedByID != 0 {
+		t.Fatalf("origin expense mutated or back-written: %+v", reloaded)
 	}
-	if reloaded.ReversedByID != rev.ID {
-		t.Fatalf("reversed_by_id = %d, want %d", reloaded.ReversedByID, rev.ID)
+
+	// 读取路径（按案件）必须派生出已冲销标记与冲销它的那笔明细 ID。
+	entries, err := svc.ListEntriesByCase(caseID)
+	if err != nil {
+		t.Fatalf("list by case: %v", err)
 	}
+	var derived *model.FundEntry
+	for i := range entries {
+		if entries[i].ID == expEntry.ID {
+			derived = &entries[i]
+		}
+	}
+	if derived == nil {
+		t.Fatalf("origin expense missing from list")
+	}
+	if derived.ReversedByID != rev.ID {
+		t.Fatalf("derived reversed_by_id=%d, want %d", derived.ReversedByID, rev.ID)
+	}
+
+	// 再次冲销必须被拒（已冲销），余额不被重复冲销。
+	if _, _, err := svc.ReverseEntry(expEntry.ID, "再次冲销", "rev-again", testOp); err == nil {
+		t.Fatalf("second reversal must be rejected")
+	} else if appErrorCodeErr(err) != constants.CodeFundAlreadyReversed {
+		t.Fatalf("second reversal code=%d, want %d", appErrorCodeErr(err), constants.CodeFundAlreadyReversed)
+	}
+
 	if got := mustBalance(t, svc, caseID, clientID); got != originSnap {
 		t.Fatalf("balance after reversing expense = %d, want %d", got, originSnap)
 	}
