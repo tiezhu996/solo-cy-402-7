@@ -370,6 +370,62 @@ func TestReversalKeepsOriginImmutable(t *testing.T) {
 	}
 }
 
+// 8b. 原预收/支出被冲销后，用原幂等键重试：只回放同一笔、响应带反向冲销关联，不新增任何余额变动或记录。
+func TestSameKeyReplayAfterReversalShowsLink(t *testing.T) {
+	db := newTestDB(t)
+	svc, caseID, clientID := newFundService(seededDB(t, db))
+
+	// 预收（键 k-pre）后支出（键 k-exp），使预收可被冲销（余额足够）。
+	pre := mustPrepay(t, svc, caseID, clientID, 1000, "k-pre")
+	exp, _, err := svc.RegisterExpense(caseID, clientID, 300, "支出", "", "k-exp", testOp)
+	if err != nil {
+		t.Fatalf("expense: %v", err)
+	}
+
+	// 冲销预收（-1000）：当前余额 700 不足，会被拒；先冲销支出（+300）再冲销预收即可。
+	revExp, _, err := svc.ReverseEntry(exp.ID, "冲销支出", "rev-exp", testOp)
+	if err != nil {
+		t.Fatalf("reverse expense: %v", err)
+	}
+	revPre, _, err := svc.ReverseEntry(pre.ID, "冲销预收", "rev-pre", testOp)
+	if err != nil {
+		t.Fatalf("reverse prepay: %v", err)
+	}
+	entriesBefore := countEntries(t, db)
+
+	// 用支出原键重试：回放的必须是同一笔支出，且带 reversed_by_id 指向其冲销明细。
+	replayExp, replayed, err := svc.RegisterExpense(caseID, clientID, 300, "支出", "", "k-exp", testOp)
+	if err != nil {
+		t.Fatalf("replay expense: %v", err)
+	}
+	if !replayed || replayExp.ID != exp.ID {
+		t.Fatalf("expense replay must be canonical id=%d, got id=%d replayed=%v", exp.ID, replayExp.ID, replayed)
+	}
+	if replayExp.ReversedByID != revExp.ID {
+		t.Fatalf("expense replay reversed_by_id=%d, want %d", replayExp.ReversedByID, revExp.ID)
+	}
+
+	// 用预收原键重试：回放同一笔预收，带其冲销关联。
+	replayPre, replayed, err := svc.RegisterPrepayment(caseID, clientID, 1000, "预收", "", "k-pre", testOp)
+	if err != nil {
+		t.Fatalf("replay prepay: %v", err)
+	}
+	if !replayed || replayPre.ID != pre.ID {
+		t.Fatalf("prepay replay must be canonical id=%d, got id=%d replayed=%v", pre.ID, replayPre.ID, replayed)
+	}
+	if replayPre.ReversedByID != revPre.ID {
+		t.Fatalf("prepay replay reversed_by_id=%d, want %d", replayPre.ReversedByID, revPre.ID)
+	}
+
+	// 回放不得新增余额变动或新记录。
+	if countEntries(t, db) != entriesBefore {
+		t.Fatalf("replay must not insert records: before=%d after=%d", entriesBefore, countEntries(t, db))
+	}
+	if got := mustBalance(t, svc, caseID, clientID); got != 0 {
+		t.Fatalf("balance after replays = %d, want 0 (no new movement)", got)
+	}
+}
+
 // 9. 冲销预收款但当前余额不足：拒绝，余额与明细不变。
 func TestReversePrepaymentInsufficientDenied(t *testing.T) {
 	db := newTestDB(t)

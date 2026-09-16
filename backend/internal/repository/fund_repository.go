@@ -75,7 +75,26 @@ func (r *FundRepository) replayIfPresent(key string) (*PostedResult, bool) {
 	if err != nil || e == nil {
 		return nil, false
 	}
+	if err := r.hydrateReversed(r.db, e); err != nil {
+		return nil, false
+	}
 	return &PostedResult{Entry: e, Replayed: true, AccountID: e.AccountID}, true
+}
+
+// finalize 事务提交后为返回明细补齐反向冲销关联，使新入账与同键重放的响应口径一致。
+func (r *FundRepository) finalize(result *PostedResult, err error, idem string) (*PostedResult, error) {
+	if err != nil {
+		if replay, ok := r.replayIfPresent(idem); ok {
+			return replay, nil
+		}
+		return nil, err
+	}
+	if result != nil && result.Entry != nil {
+		if herr := r.hydrateReversed(r.db, result.Entry); herr != nil {
+			return nil, herr
+		}
+	}
+	return result, nil
 }
 
 // FindEntryByIdempotencyKey 按幂等键查找已入账明细；不存在返回 (nil, nil)。
@@ -197,6 +216,11 @@ func (r *FundRepository) findExistingReversalID(tx *gorm.DB, originID uint64) (u
 // AttachReversedByID 为一批明细按 reversal_of_id 反向填充「已被哪笔冲销」。
 // 这是只读派生：原明细本身从不被写回，金额、余额快照、幂等键等保持入账时原样。
 func (r *FundRepository) AttachReversedByID(entries []model.FundEntry) error {
+	return r.attachReversedByID(r.db, entries)
+}
+
+// attachReversedByID 同上，但允许在指定事务/连接上执行（幂等回放需在当前事务内读取）。
+func (r *FundRepository) attachReversedByID(q *gorm.DB, entries []model.FundEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -214,7 +238,7 @@ func (r *FundRepository) AttachReversedByID(entries []model.FundEntry) error {
 		ID           uint64
 	}
 	var links []link
-	if err := r.db.Model(&model.FundEntry{}).
+	if err := q.Model(&model.FundEntry{}).
 		Select("id, reversal_of_id").
 		Where("reversal_of_id IN ?", originIDs).
 		Scan(&links).Error; err != nil {
@@ -229,6 +253,24 @@ func (r *FundRepository) AttachReversedByID(entries []model.FundEntry) error {
 			entries[i].ReversedByID = rid
 		}
 	}
+	return nil
+}
+
+// hydrateReversed 在给定事务内为单条回放明细填充反向冲销关联，
+// 保证「同键重试」回放的响应与明细列表一致（已被冲销时返回 reversed_by_id/reversed）。
+func (r *FundRepository) hydrateReversed(q *gorm.DB, e *model.FundEntry) error {
+	if e == nil || e.EntryType == "reversal" {
+		return nil
+	}
+	var rev model.FundEntry
+	err := q.Select("id").Where("reversal_of_id = ?", e.ID).First(&rev).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("hydrate reversed_by_id: %w", err)
+	}
+	e.ReversedByID = rev.ID
 	return nil
 }
 
@@ -277,13 +319,7 @@ func (r *FundRepository) PostPrepayment(entry *model.FundEntry) (*PostedResult, 
 		result = &PostedResult{Entry: entry, AccountID: acc.ID}
 		return nil
 	})
-	if err != nil {
-		if replay, ok := r.replayIfPresent(entry.IdempotencyKey); ok {
-			return replay, nil
-		}
-		return nil, err
-	}
-	return result, nil
+	return r.finalize(result, err, entry.IdempotencyKey)
 }
 
 // PostExpense 登记一笔办案支出（delta 为负）。余额不足时条件不命中 → 返回 ErrInsufficient，
@@ -333,13 +369,7 @@ func (r *FundRepository) PostExpense(entry *model.FundEntry) (*PostedResult, err
 		result = &PostedResult{Entry: entry, AccountID: acc.ID}
 		return nil
 	})
-	if err != nil {
-		if replay, ok := r.replayIfPresent(entry.IdempotencyKey); ok {
-			return replay, nil
-		}
-		return nil, err
-	}
-	return result, nil
+	return r.finalize(result, err, entry.IdempotencyKey)
 }
 
 // PostReversal 对一条已入账明细做反向冲销，整笔事务：
@@ -440,13 +470,7 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 		result = &PostedResult{Entry: reversal, AccountID: acc.ID}
 		return nil
 	})
-	if err != nil {
-		if replay, ok := r.replayIfPresent(reversal.IdempotencyKey); ok {
-			return replay, nil
-		}
-		return nil, err
-	}
-	return result, nil
+	return r.finalize(result, err, reversal.IdempotencyKey)
 }
 
 // ReconcileAccount 重算指定专案账户的权威余额（对 posted 明细求带符号和），

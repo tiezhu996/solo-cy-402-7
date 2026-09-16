@@ -148,6 +148,31 @@ func TestFundHTTPEndToEnd(t *testing.T) {
 		t.Fatalf("double reverse code=%d body=%v", code, body)
 	}
 
+	// 冲销后用支出的原幂等键重试：回放同一笔，响应与列表口径一致带 reversed/reversed_by_id。
+	code, body = doJSON(t, r, "POST", "/api/v1/fund/expenses", map[string]any{
+		"case_id": caseID, "client_id": 1, "amount": "60.00",
+		"subject": "差旅", "idempotency_key": "exp-60",
+	})
+	if code != 200 {
+		t.Fatalf("same-key replay after reversal: %v", body)
+	}
+	replayData := body["data"].(map[string]any)
+	if replayData["replayed"] != true {
+		t.Fatalf("replay must be marked replayed: %v", replayData)
+	}
+	replayEntry := replayData["entry"].(map[string]any)
+	if uint64(replayEntry["id"].(float64)) != expenseID || replayEntry["reversed"] != true {
+		t.Fatalf("replay entry must be canonical expense and show reversed: %v", replayEntry)
+	}
+	if replayEntry["reversed_by_id"].(float64) == 0 {
+		t.Fatalf("replay entry must carry reversed_by_id link: %v", replayEntry)
+	}
+	// 回放不动余额：仍为 100。
+	code, body = doJSON(t, r, "GET", "/api/v1/fund/balance?case_id="+itoaH(int(caseID))+"&client_id=1", nil)
+	if body["data"].(map[string]any)["balance"] != "100.00" {
+		t.Fatalf("balance changed by replay: %v", body["data"])
+	}
+
 	// 列表读回：原支出明细仍显示已冲销（reversed=true、reversed_by_id 指向冲销明细），
 	// 且包含那条只追加的冲销明细；原明细金额等字段不变。
 	code, body = doJSON(t, r, "GET", "/api/v1/fund/entries?case_id="+itoaH(int(caseID))+"&page_size=50", nil)
