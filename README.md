@@ -199,8 +199,14 @@ cy-402/
 - **重启一致**：余额是明细的物化缓存，权威余额始终可由 `SUM(delta_cents)` 重算；
   `GET /fund/balance` 与账户列表同时返回物化值、重算值与 `consistent` 标记。
 
-并发控制：写事务内对专案账户行 `SELECT ... FOR UPDATE` 串行化（SQLite 等无行锁方言由进程内写互斥补充），
-冲突后回查幂等键，跨进程仍以数据库唯一约束为准。相关表：`fund_accounts`、`fund_entries`。
+- **多实例首笔并发安全**：专案账户用 `INSERT ... ON CONFLICT (case_id, client_id) DO NOTHING` 创建，
+  再 `FOR UPDATE` 回读唯一账户行。多个服务实例同时为一个尚无账户的案件记首笔预收/支出时，
+  不会因唯一约束冲突使 PostgreSQL 事务进入 aborted 状态而返回内部错误——各请求各自成功、账户只建一个；
+  同键重试仍只入账一次。
+
+并发控制：写事务内对专案账户行 `SELECT ... FOR UPDATE` 串行化；拿到账户/原明细行锁后再次复查幂等键，
+使跨实例的同键并发在锁等待结束后回放首笔而非报唯一冲突（SQLite 等无行锁方言由全局写互斥补充），
+冲突后回查幂等键，跨进程最终以数据库唯一约束为准。相关表：`fund_accounts`、`fund_entries`。
 
 ### FundEntryType（prepayment/expense/reversal）出现位置
 

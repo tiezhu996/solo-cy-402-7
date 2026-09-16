@@ -19,12 +19,27 @@ import (
 //  1. 数据库层（权威、跨进程）：写事务内对专案账户行 SELECT ... FOR UPDATE 串行化；
 //     余额非负由「条件 UPDATE ... WHERE balance_cents + ? >= 0」与 CHECK 约束双重兜底；
 //     幂等键唯一索引保证重复提交/并发重试只入账一次；部分唯一索引 + reversed_by_id 抢占
-//     保证同一明细最多被冲销一次。
-//  2. 进程层（补充、确定性）：writeMu 串行化本进程内的入账事务，避免 SQLite 等无行锁方言下
-//     的快照写冲突，并减少不必要的回滚重试。多实例部署时仍以数据库约束为准。
+//     保证同一明细最多被冲销一次。账户创建用 INSERT ... ON CONFLICT DO NOTHING，多实例并发
+//     首笔也不会因唯一冲突导致事务 abort 而返回内部错误。
+//  2. 进程层（补充、确定性）：Postgres 由行锁保证跨实例正确，仅用本仓储互斥减少无谓回滚；
+//     SQLite 没有行锁，用包级全局互斥把所有资金写事务串行化（含不同仓储/服务实例），
+//     避免其 deferred 事务的 SQLITE_BUSY_SNAPSHOT 写冲突。
 type FundRepository struct {
 	db      *gorm.DB
 	writeMu sync.Mutex
+}
+
+// sqliteGlobalWriteMu 在 SQLite 下串行化全部资金写事务（跨不同仓储实例，模拟多实例）。
+var sqliteGlobalWriteMu sync.Mutex
+
+// beginWrite 取得写事务互斥，返回释放函数。
+func (r *FundRepository) beginWrite() func() {
+	if r.db.Dialector.Name() == "sqlite" {
+		sqliteGlobalWriteMu.Lock()
+		return sqliteGlobalWriteMu.Unlock
+	}
+	r.writeMu.Lock()
+	return r.writeMu.Unlock
 }
 
 // NewFundRepository 构造资金台账仓储。
@@ -107,24 +122,23 @@ func (r *FundRepository) lockAccount(tx *gorm.DB, caseID, clientID uint64) (*mod
 	return &acc, nil
 }
 
-// getOrCreateAccount 账户不存在则创建（唯一索引保证并发仅一笔插入成功），随后加锁返回。
+// getOrCreateAccount 返回持锁的专案账户行；不存在则创建。
+//
+// 关键：使用 INSERT ... ON CONFLICT (case_id, client_id) DO NOTHING，而不是「先 Create 再捕获唯一冲突」。
+// 在 PostgreSQL 中，事务一旦发生唯一约束冲突就会进入 aborted 状态、后续语句全部失败；
+// 多个服务实例并发首笔记账时，落败的那笔即使捕获了错误也无法在同一事务里继续，最终整笔回滚、返回内部错误。
+// ON CONFLICT DO NOTHING 在冲突时不报错、不污染事务，随后统一 FOR UPDATE 回读唯一账户行即可。
 func (r *FundRepository) getOrCreateAccount(tx *gorm.DB, caseID, clientID uint64) (*model.FundAccount, error) {
-	acc, err := r.lockAccount(tx, caseID, clientID)
-	if err == nil {
-		return acc, nil
-	}
-	if !errors.Is(err, ErrNotFound) {
-		return nil, err
-	}
 	newAcc := &model.FundAccount{CaseID: caseID, ClientID: clientID, BalanceCents: 0}
-	if err := tx.Create(newAcc).Error; err != nil {
-		if IsDuplicateKeyErr(err) {
-			// 并发时另一事务已创建，重新加锁读取。
-			return r.lockAccount(tx, caseID, clientID)
-		}
-		return nil, fmt.Errorf("create fund account: %w", err)
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "case_id"}, {Name: "client_id"}},
+		DoNothing: true,
+	}).Create(newAcc).Error; err != nil {
+		return nil, fmt.Errorf("ensure fund account: %w", err)
 	}
-	return newAcc, nil
+	// 无论本次是否真的插入，都重新加锁读取唯一账户行：
+	// 并发下若账户由另一事务先建，这里的 FOR UPDATE 会阻塞至其提交后读到已提交的行。
+	return r.lockAccount(tx, caseID, clientID)
 }
 
 // applyDelta 在持有的账户行上做带条件的原子增减。
@@ -187,8 +201,8 @@ func (r *FundRepository) PostPrepayment(entry *model.FundEntry) (*PostedResult, 
 		return nil, fmt.Errorf("post prepayment: delta must be positive, got %d", entry.DeltaCents)
 	}
 	var result *PostedResult
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
+	release := r.beginWrite()
+	defer release()
 	err := r.db.Transaction(func(tx *gorm.DB) error {
 		if existing, err := r.FindEntryByIdempotencyKey(tx, entry.IdempotencyKey); err != nil {
 			return err
@@ -199,6 +213,14 @@ func (r *FundRepository) PostPrepayment(entry *model.FundEntry) (*PostedResult, 
 		acc, err := r.getOrCreateAccount(tx, entry.CaseID, entry.ClientID)
 		if err != nil {
 			return err
+		}
+		// 拿到账户行锁后再查一次幂等键：多实例下另一实例可能已在锁等待期间提交同键首笔，
+		// 此时必须回放该笔，绝不能再插入（否则会触发唯一冲突并污染事务）。
+		if existing, err := r.FindEntryByIdempotencyKey(tx, entry.IdempotencyKey); err != nil {
+			return err
+		} else if existing != nil {
+			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
+			return nil
 		}
 		if ok, err := r.applyDelta(tx, acc.ID, entry.DeltaCents, false); err != nil {
 			return err
@@ -233,8 +255,8 @@ func (r *FundRepository) PostExpense(entry *model.FundEntry) (*PostedResult, err
 		return nil, fmt.Errorf("post expense: delta must be negative, got %d", entry.DeltaCents)
 	}
 	var result *PostedResult
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
+	release := r.beginWrite()
+	defer release()
 	err := r.db.Transaction(func(tx *gorm.DB) error {
 		if existing, err := r.FindEntryByIdempotencyKey(tx, entry.IdempotencyKey); err != nil {
 			return err
@@ -245,6 +267,13 @@ func (r *FundRepository) PostExpense(entry *model.FundEntry) (*PostedResult, err
 		acc, err := r.getOrCreateAccount(tx, entry.CaseID, entry.ClientID)
 		if err != nil {
 			return err
+		}
+		// 同预收：行锁后复查幂等键，避免多实例同键并发在等待锁后重复插入。
+		if existing, err := r.FindEntryByIdempotencyKey(tx, entry.IdempotencyKey); err != nil {
+			return err
+		} else if existing != nil {
+			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
+			return nil
 		}
 		ok, err := r.applyDelta(tx, acc.ID, entry.DeltaCents, true)
 		if err != nil {
@@ -283,8 +312,8 @@ func (r *FundRepository) PostExpense(entry *model.FundEntry) (*PostedResult, err
 //  5. 追加冲销明细。原明细永不修改、永不删除。
 func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64) (*PostedResult, error) {
 	var result *PostedResult
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
+	release := r.beginWrite()
+	defer release()
 	err := r.db.Transaction(func(tx *gorm.DB) error {
 		if existing, err := r.FindEntryByIdempotencyKey(tx, reversal.IdempotencyKey); err != nil {
 			return err
@@ -300,7 +329,15 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 		if origin.IsReversal() {
 			return ErrCannotReverseReversal
 		}
-		// 行锁内若已被其他事务冲销，立即拒绝（并发重复冲销的主路径），避免误判为余额不足。
+		// 锁住原明细后复查幂等键：多实例下同键冲销并发，落败方在 FOR UPDATE 等待后，
+		// 胜出方已提交该冲销明细，此时应回放首笔，而不是按「已冲销」拒绝。
+		if existing, err := r.FindEntryByIdempotencyKey(tx, reversal.IdempotencyKey); err != nil {
+			return err
+		} else if existing != nil {
+			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
+			return nil
+		}
+		// 行锁内若已被其他事务（用不同幂等键）冲销，立即拒绝（并发重复冲销的主路径），避免误判为余额不足。
 		if origin.ReversedByID != 0 {
 			return ErrAlreadyReversed
 		}
@@ -308,6 +345,13 @@ func (r *FundRepository) PostReversal(reversal *model.FundEntry, originID uint64
 		acc, err := r.lockAccount(tx, origin.CaseID, origin.ClientID)
 		if err != nil {
 			return err
+		}
+		// 账户锁后再保险复查一次幂等键。
+		if existing, err := r.FindEntryByIdempotencyKey(tx, reversal.IdempotencyKey); err != nil {
+			return err
+		} else if existing != nil {
+			result = &PostedResult{Entry: existing, Replayed: true, AccountID: existing.AccountID}
+			return nil
 		}
 
 		delta := -origin.DeltaCents // 反向

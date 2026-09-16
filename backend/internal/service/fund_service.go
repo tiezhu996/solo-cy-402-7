@@ -1,10 +1,11 @@
 package service
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
-	"sync/atomic"
 	"time"
 
 	"cylawcase/internal/constants"
@@ -25,7 +26,6 @@ type FundService struct {
 	caseRepo   *repository.CaseRepository
 	clientRepo *repository.ClientRepository
 	logger     *slog.Logger
-	seq        uint64
 }
 
 // NewFundService 构造资金台账服务。
@@ -63,9 +63,15 @@ func (s *FundService) validateAmount(cents int64, action string) error {
 	return nil
 }
 
+// nextEntryNo 生成全局唯一的资金流水号：前缀 + 纳秒时间戳 + 随机后缀。
+// 必须含随机分量，否则多个服务实例在同一纳秒会生成相同流水号，触发唯一冲突导致整笔失败。
 func (s *FundService) nextEntryNo(prefix string) string {
-	n := atomic.AddUint64(&s.seq, 1)
-	return fmt.Sprintf("%s%d%04d", prefix, time.Now().UnixNano(), n%10000)
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand 失败极罕见；退回时间戳拼接仍可保证进程内不重复。
+		return fmt.Sprintf("%s%dX", prefix, time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%s%d%s", prefix, time.Now().UnixNano(), hex.EncodeToString(b[:]))
 }
 
 // RegisterPrepayment 登记客户预收款：同一案件+客户，余额增加。幂等键保证重复提交/并发重试仅入账一次。
